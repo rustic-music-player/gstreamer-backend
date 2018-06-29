@@ -1,0 +1,15 @@
+[package]
+name = "rustic-gstreamer-backend"
+version = "0.1.0"
+authors = ["Max Jöhnk <maxjoehnk@gmail.com>"]
+
+[dependencies]
+crossbeam-channel = "0.2"
+log = "0.4"
+failure = "0.1"
+url = "1.7"
+gstreamer = "0.10.0"
+glib = "0.4.0"
+
+[dependencies.rustic-core]
+path = "../core"
