@@ -1,21 +1,28 @@
-use super::player::*;
-use super::state::PlayerState;
-use library::Track;
+extern crate rustic_core as core;
+extern crate gstreamer as gst;
+#[macro_use]
+extern crate failure;
+#[macro_use]
+extern crate log;
+extern crate crossbeam_channel as channel;
+
+use core::{PlayerBackend, PlayerState, PlayerEvent, Track};
 use failure::{Error, err_msg};
 use std::time::Duration;
-use channel::{self, Sender, Receiver};
-use gstreamer::{self as gst, prelude::*, MessageView, StateChangeReturn};
-use std::sync::{atomic, Mutex, Arc};
+use channel::{Sender, Receiver};
+use gst::{prelude::*, MessageView, StateChangeReturn};
+use std::sync::Arc;
 use std::thread;
+use std::any::Any;
 
 #[derive(Debug)]
 pub struct GstBackend {
-    queue: Mutex<Vec<Track>>,
-    current_index: atomic::AtomicUsize,
-    current_track: Mutex<Option<Track>>,
-    current_volume: atomic::AtomicUsize,
-    state: Mutex<PlayerState>,
-    blend_time: Mutex<Duration>,
+    queue: Vec<Track>,
+    current_index: usize,
+    current_track: Option<Track>,
+    current_volume: f32,
+    state: PlayerState,
+    blend_time: Duration,
     pipeline: gst::Pipeline,
     decoder: gst::Element,
     volume: gst::Element,
@@ -25,7 +32,8 @@ pub struct GstBackend {
 }
 
 impl GstBackend {
-    fn new() -> Result<Arc<GstBackend>, Error> {
+    pub fn new() -> Result<Arc<Box<PlayerBackend>>, Error> {
+        gst::init()?;
         let pipeline = gst::Pipeline::new(None);
         let decoder = gst::ElementFactory::make("uridecodebin", None)
             .ok_or_else(|| err_msg("can't build uridecodebin"))?;
@@ -35,12 +43,12 @@ impl GstBackend {
             .ok_or_else(|| err_msg("can't build autoaudiosink"))?;
         let (tx, rx) = channel::unbounded();
         let backend = GstBackend {
-            queue: Mutex::new(vec![]),
-            current_index: atomic::AtomicUsize::new(0),
-            current_track: Mutex::new(None),
-            blend_time: Mutex::new(Duration::default()),
-            current_volume: atomic::AtomicUsize::new(100),
-            state: Mutex::new(PlayerState::Stop),
+            queue: vec![],
+            current_index: 0,
+            current_track: None,
+            blend_time: Duration::default(),
+            current_volume: 1.0,
+            state: PlayerState::Stop,
             pipeline,
             decoder,
             volume,
@@ -60,19 +68,24 @@ impl GstBackend {
             pad.link(&sink_pad);
         });
 
-        let backend = Arc::new(backend);
+        let backend: Arc<Box<PlayerBackend>> = Arc::new(Box::new(backend));
 
         {
-            let backend = Arc::clone(&backend);
+            let gst_backend = Arc::clone(&backend);
+            let mut backend = Arc::clone(&backend);
             thread::spawn(move|| {
-                if let Some(bus) = backend.pipeline.get_bus() {
+                let gst_backend: &GstBackend = match gst_backend.as_any().downcast_ref::<GstBackend>() {
+                    Some(b) => b,
+                    None => panic!("Not a GstBackend")
+                };
+                if let Some(bus) = gst_backend.pipeline.get_bus() {
                     let res: Result<(), Error> = match bus.pop() {
                         None => Ok(()),
                         Some(msg) => {
                             match msg.view() {
                                 MessageView::Eos(..) => {
                                     println!("eos");
-                                    let backend = Arc::clone(&backend);
+                                    let backend = Arc::get_mut(&mut backend).unwrap();
                                     backend.next()?;
                                     Ok(())
                                 },
@@ -103,7 +116,7 @@ impl GstBackend {
         }
         self.decoder.set_property_from_str("uri", track.stream_url.as_str());
 
-        let state = match *self.state.lock().unwrap() {
+        let state = match self.state {
             PlayerState::Play => gst::State::Playing,
             PlayerState::Pause => gst::State::Paused,
             PlayerState::Stop => gst::State::Null
@@ -118,44 +131,37 @@ impl GstBackend {
 
 impl PlayerBackend for GstBackend {
     fn enqueue(&mut self, track: &Track) {
-        let mut queue = self.queue.lock().unwrap();
-        queue.push(track.clone());
+        self.queue.push(track.clone());
     }
 
     fn enqueue_multiple(&mut self, tracks: &[Track]) {
-        let mut queue = self.queue.lock().unwrap();
-        queue.append(&mut tracks.to_vec());
+        self.queue.append(&mut tracks.to_vec());
     }
 
     fn play_next(&mut self, track: &Track) {
-        let current_index = self.current_index.load(atomic::Ordering::Relaxed);
-        let mut queue = self.queue.lock().unwrap();
-        queue.insert(current_index + 1, track.clone());
+        self.queue.insert(self.current_index + 1, track.clone());
     }
 
     fn queue(&self) -> Vec<Track> {
-        self.queue.lock().unwrap().clone()
+        self.queue.clone()
     }
 
     fn clear_queue(&mut self) {
-        self.queue.lock().unwrap().clear();
-        self.current_index.store(0, atomic::Ordering::Relaxed);
+        self.queue.clear();
     }
 
     fn current(&self) -> Option<Track> {
-        self.current_track.lock().unwrap().clone()
+        self.current_track.clone()
     }
 
     fn prev(&mut self) -> Result<Option<()>, Error> {
-        let current_index = self.current_index.load(atomic::Ordering::Relaxed);
-        if current_index == 0 {
+        if self.current_index == 0 {
             self.set_state(PlayerState::Stop)?;
             return Ok(None);
         }
-        self.current_index.store(current_index - 1, atomic::Ordering::Relaxed);
-        let current_track = self.current_track.lock().unwrap();
-        *current_track = self.queue.lock().unwrap().get(current_index - 1).cloned();
-        if let Some(track) = current_track.clone() {
+        self.current_index -= 1;
+        self.current_track = self.queue.get(self.current_index).cloned();
+        if let Some(track) = self.current_track.clone() {
             self.set_track(&track)?;
             Ok(Some(()))
         }else {
@@ -164,15 +170,13 @@ impl PlayerBackend for GstBackend {
     }
 
     fn next(&mut self) -> Result<Option<()>, Error> {
-        let current_index = self.current_index.load(atomic::Ordering::Relaxed);
-        if current_index >= self.queue.lock().unwrap().len() {
+        if self.current_index >= self.queue.len() {
             self.set_state(PlayerState::Stop)?;
             return Ok(None);
         }
-        self.current_index.store(current_index + 1, atomic::Ordering::Relaxed);
-        let current_track = self.current_track.lock().unwrap();
-        *current_track = self.queue.lock().unwrap().get(current_index + 1).cloned();
-        if let Some(track) = current_track.clone() {
+        self.current_index += 1;
+        self.current_track = self.queue.get(self.current_index).cloned();
+        if let Some(track) = self.current_track.clone() {
             self.set_track(&track)?;
             Ok(Some(()))
         }else {
@@ -181,24 +185,28 @@ impl PlayerBackend for GstBackend {
     }
 
     fn set_state(&mut self, new_state: PlayerState) -> Result<(), Error> {
-        if let StateChangeReturn::Failure = self.pipeline.set_state(new_state.clone().into()) {
+        let gst_state = match new_state {
+            PlayerState::Play => gst::State::Playing,
+            PlayerState::Pause => gst::State::Paused,
+            PlayerState::Stop => gst::State::Null
+        };
+        if let StateChangeReturn::Failure = self.pipeline.set_state(gst_state) {
             bail!("can't play pipeline")
         }
-        let mut state = self.state.lock().unwrap();
-        *state = new_state;
+        self.state = new_state;
         Ok(())
     }
 
     fn state(&self) -> PlayerState {
-        self.state.lock().unwrap().clone()
+        self.state
     }
 
-    fn set_volume(&mut self, volume: usize) -> Result<(), Error> {
+    fn set_volume(&mut self, volume: f32) -> Result<(), Error> {
         unimplemented!()
     }
 
-    fn volume(&self) -> usize {
-        self.current_volume.load(atomic::Ordering::Relaxed)
+    fn volume(&self) -> f32 {
+        self.current_volume
     }
 
     fn set_blend_time(&mut self, duration: Duration) -> Result<(), Error> {
@@ -206,7 +214,7 @@ impl PlayerBackend for GstBackend {
     }
 
     fn blend_time(&self) -> Duration {
-        self.blend_time.lock().unwrap().clone()
+        self.blend_time
     }
 
     fn seek(&mut self, duration: Duration) -> Result<(), Error> {
@@ -215,5 +223,9 @@ impl PlayerBackend for GstBackend {
 
     fn observe(&self) -> Receiver<PlayerEvent> {
         unimplemented!()
+    }
+
+    fn as_any(&self) -> &Any {
+        self
     }
 }
