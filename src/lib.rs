@@ -5,6 +5,7 @@ extern crate failure;
 #[macro_use]
 extern crate log;
 extern crate crossbeam_channel as channel;
+extern crate pinboard;
 
 use core::{PlayerBackend, PlayerState, PlayerEvent, Track};
 use failure::{Error, err_msg};
@@ -14,14 +15,15 @@ use gst::{prelude::*, MessageView, StateChangeReturn};
 use std::sync::Arc;
 use std::thread;
 use std::any::Any;
+use pinboard::{NonEmptyPinboard};
 
 #[derive(Debug)]
 pub struct GstBackend {
-    queue: Vec<Track>,
+    queue: NonEmptyPinboard<Vec<Track>>,
     current_index: usize,
-    current_track: Option<Track>,
+    current_track: NonEmptyPinboard<Option<Track>>,
     current_volume: f32,
-    state: PlayerState,
+    state: NonEmptyPinboard<PlayerState>,
     blend_time: Duration,
     pipeline: gst::Pipeline,
     decoder: gst::Element,
@@ -43,12 +45,12 @@ impl GstBackend {
             .ok_or_else(|| err_msg("can't build autoaudiosink"))?;
         let (tx, rx) = channel::unbounded();
         let backend = GstBackend {
-            queue: vec![],
+            queue: NonEmptyPinboard::new(vec![]),
             current_index: 0,
-            current_track: None,
+            current_track: NonEmptyPinboard::new(None),
             blend_time: Duration::default(),
             current_volume: 1.0,
-            state: PlayerState::Stop,
+            state: NonEmptyPinboard::new(PlayerState::Stop),
             pipeline,
             decoder,
             volume,
@@ -85,7 +87,6 @@ impl GstBackend {
                             match msg.view() {
                                 MessageView::Eos(..) => {
                                     println!("eos");
-                                    let backend = Arc::get_mut(&mut backend).unwrap();
                                     backend.next()?;
                                     Ok(())
                                 },
@@ -109,14 +110,14 @@ impl GstBackend {
         Ok(backend)
     }
 
-    fn set_track(&mut self, track: &Track) -> Result<(), Error> {
+    fn set_track(&self, track: &Track) -> Result<(), Error> {
         debug!("Selecting {:?}", track);
         if let StateChangeReturn::Failure = self.pipeline.set_state(gst::State::Null) {
             bail!("can't stop pipeline")
         }
         self.decoder.set_property_from_str("uri", track.stream_url.as_str());
 
-        let state = match self.state {
+        let state = match self.state.read() {
             PlayerState::Play => gst::State::Playing,
             PlayerState::Pause => gst::State::Paused,
             PlayerState::Stop => gst::State::Null
@@ -125,83 +126,115 @@ impl GstBackend {
         if let StateChangeReturn::Failure = self.pipeline.set_state(state) {
             bail!("can't restart pipeline")
         }
+
+        self.tx.send(PlayerEvent::TrackChanged(track.clone()));
+        self.current_track.set(Some(track.clone()));
+
         Ok(())
+    }
+
+    fn write_state(&self, state: PlayerState) {
+        self.state.set(state);
+        self.tx.send(PlayerEvent::StateChanged(state));
     }
 }
 
 impl PlayerBackend for GstBackend {
-    fn enqueue(&mut self, track: &Track) {
-        self.queue.push(track.clone());
+    fn queue_single(&self, track: &Track) {
+        let mut queue = self.queue.read();
+        queue.push(track.clone());
+        self.queue.set(queue);
     }
 
-    fn enqueue_multiple(&mut self, tracks: &[Track]) {
-        self.queue.append(&mut tracks.to_vec());
+    fn queue_multiple(&self, tracks: &[Track]) {
+        let mut queue = self.queue.read();
+        queue.append(&mut tracks.to_vec());
+        self.queue.set(queue);
     }
 
-    fn play_next(&mut self, track: &Track) {
-        self.queue.insert(self.current_index + 1, track.clone());
+    fn queue_next(&self, track: &Track) {
+        let mut queue = self.queue.read();
+        queue.insert(self.current_index + 1, track.clone());
+        self.queue.set(queue);
     }
 
-    fn queue(&self) -> Vec<Track> {
-        self.queue.clone()
+    fn get_queue(&self) -> Vec<Track> {
+        self.queue.read()
     }
 
-    fn clear_queue(&mut self) {
-        self.queue.clear();
+    fn clear_queue(&self) {
+        self.queue.set(vec![]);
     }
 
     fn current(&self) -> Option<Track> {
-        self.current_track.clone()
+        self.current_track.read()
     }
 
-    fn prev(&mut self) -> Result<Option<()>, Error> {
-        if self.current_index == 0 {
-            self.set_state(PlayerState::Stop)?;
-            return Ok(None);
-        }
-        self.current_index -= 1;
-        self.current_track = self.queue.get(self.current_index).cloned();
-        if let Some(track) = self.current_track.clone() {
-            self.set_track(&track)?;
-            Ok(Some(()))
-        }else {
-            Ok(None)
-        }
+    fn prev(&self) -> Result<Option<()>, Error> {
+        unimplemented!();
+//        if self.current_index == 0 {
+//            self.set_state(PlayerState::Stop)?;
+//            return Ok(None);
+//        }
+//        self.current_index -= 1;
+//        self.current_track = self.queue.get(self.current_index).cloned();
+//        if let Some(track) = self.current_track.clone() {
+//            self.set_track(&track)?;
+//            Ok(Some(()))
+//        }else {
+//            Ok(None)
+//        }
     }
 
-    fn next(&mut self) -> Result<Option<()>, Error> {
-        if self.current_index >= self.queue.len() {
-            self.set_state(PlayerState::Stop)?;
-            return Ok(None);
-        }
-        self.current_index += 1;
-        self.current_track = self.queue.get(self.current_index).cloned();
-        if let Some(track) = self.current_track.clone() {
-            self.set_track(&track)?;
-            Ok(Some(()))
-        }else {
-            Ok(None)
-        }
+    fn next(&self) -> Result<Option<()>, Error> {
+        unimplemented!();
+//        if self.current_index >= self.queue.len() {
+//            self.set_state(PlayerState::Stop)?;
+//            return Ok(None);
+//        }
+//        self.current_index += 1;
+//        self.current_track = self.queue.get(self.current_index).cloned();
+//        if let Some(track) = self.current_track.clone() {
+//            self.set_track(&track)?;
+//            Ok(Some(()))
+//        }else {
+//            Ok(None)
+//        }
     }
 
-    fn set_state(&mut self, new_state: PlayerState) -> Result<(), Error> {
-        let gst_state = match new_state {
-            PlayerState::Play => gst::State::Playing,
-            PlayerState::Pause => gst::State::Paused,
-            PlayerState::Stop => gst::State::Null
-        };
-        if let StateChangeReturn::Failure = self.pipeline.set_state(gst_state) {
-            bail!("can't play pipeline")
+    fn set_state(&self, new_state: PlayerState) -> Result<(), Error> {
+        debug!("set_state, {:?}", &new_state);
+        match new_state {
+            PlayerState::Play => {
+                let queue = self.queue.read();
+                let track = &queue[self.current_index];
+                self.write_state(new_state);
+                self.set_track(track)
+            },
+            PlayerState::Pause => {
+                if let StateChangeReturn::Failure = self.pipeline.set_state(gst::State::Paused) {
+                    error!("can't play pipeline");
+                    bail!("can't play pipeline")
+                }
+                self.write_state(new_state);
+                Ok(())
+            },
+            PlayerState::Stop => {
+                if let StateChangeReturn::Failure = self.pipeline.set_state(gst::State::Null) {
+                    error!("can't play pipeline");
+                    bail!("can't play pipeline")
+                }
+                self.write_state(new_state);
+                Ok(())
+            }
         }
-        self.state = new_state;
-        Ok(())
     }
 
     fn state(&self) -> PlayerState {
-        self.state
+        self.state.read()
     }
 
-    fn set_volume(&mut self, volume: f32) -> Result<(), Error> {
+    fn set_volume(&self, _volume: f32) -> Result<(), Error> {
         unimplemented!()
     }
 
@@ -209,7 +242,7 @@ impl PlayerBackend for GstBackend {
         self.current_volume
     }
 
-    fn set_blend_time(&mut self, duration: Duration) -> Result<(), Error> {
+    fn set_blend_time(&self, _duration: Duration) -> Result<(), Error> {
         unimplemented!()
     }
 
@@ -217,12 +250,12 @@ impl PlayerBackend for GstBackend {
         self.blend_time
     }
 
-    fn seek(&mut self, duration: Duration) -> Result<(), Error> {
+    fn seek(&self, _duration: Duration) -> Result<(), Error> {
         unimplemented!()
     }
 
     fn observe(&self) -> Receiver<PlayerEvent> {
-        unimplemented!()
+        self.rx.clone()
     }
 
     fn as_any(&self) -> &Any {

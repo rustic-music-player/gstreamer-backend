@@ -13,6 +13,7 @@ log = "0.4"
 failure = "0.1"
 gstreamer = "0.10.0"
 glib = "0.4.0"
+pinboard = "2.0.0"
 
 [dependencies.rustic-core]
 path = "../core"
