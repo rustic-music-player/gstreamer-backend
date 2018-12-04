@@ -12,7 +12,7 @@ use failure::{Error, err_msg};
 use std::time::Duration;
 use channel::{Sender, Receiver};
 use gst::{prelude::*, MessageView, StateChangeReturn};
-use std::sync::Arc;
+use std::sync::{Arc, atomic};
 use std::thread;
 use std::any::Any;
 use pinboard::{NonEmptyPinboard};
@@ -20,7 +20,7 @@ use pinboard::{NonEmptyPinboard};
 #[derive(Debug)]
 pub struct GstBackend {
     queue: NonEmptyPinboard<Vec<Track>>,
-    current_index: usize,
+    current_index: atomic::AtomicUsize,
     current_track: NonEmptyPinboard<Option<Track>>,
     current_volume: f32,
     state: NonEmptyPinboard<PlayerState>,
@@ -46,7 +46,7 @@ impl GstBackend {
         let (tx, rx) = channel::unbounded();
         let backend = GstBackend {
             queue: NonEmptyPinboard::new(vec![]),
-            current_index: 0,
+            current_index: atomic::AtomicUsize::new(0),
             current_track: NonEmptyPinboard::new(None),
             blend_time: Duration::default(),
             current_volume: 1.0,
@@ -81,27 +81,48 @@ impl GstBackend {
                     None => panic!("Not a GstBackend")
                 };
                 if let Some(bus) = gst_backend.pipeline.get_bus() {
-                    let res: Result<(), Error> = match bus.pop() {
-                        None => Ok(()),
-                        Some(msg) => {
-                            match msg.view() {
-                                MessageView::Eos(..) => {
-                                    println!("eos");
-                                    backend.next()?;
-                                    Ok(())
-                                },
-                                MessageView::Error(err) => {
-                                    bail!(
-                                        "Error from {}: {} ({:?})",
-                                        msg.get_src().unwrap().get_path_string(),
-                                        err.get_error(),
-                                        err.get_debug()
-                                    );
-                                },
-                                _ => Ok(()),
-                            }
-                        },
-                    };
+                    loop {
+                        let res: Result<(), Error> = match bus.pop() {
+                            None => Ok(()),
+                            Some(msg) => {
+                                match msg.view() {
+                                    MessageView::Eos(..) => {
+                                        println!("eos");
+                                        backend.next()?;
+                                        Ok(())
+                                    },
+                                    MessageView::Error(err) => {
+                                        error!(
+                                            "Error from {}: {} ({:?})",
+                                            msg.get_src().unwrap().get_path_string(),
+                                            err.get_error(),
+                                            err.get_debug()
+                                        );
+                                        bail!(
+                                            "Error from {}: {} ({:?})",
+                                            msg.get_src().unwrap().get_path_string(),
+                                            err.get_error(),
+                                            err.get_debug()
+                                        );
+                                    },
+                                    MessageView::Buffering(buffering) => {
+                                        debug!("buffering {}", buffering.get_percent());
+                                        Ok(())
+                                    },
+                                    MessageView::Warning(warning) => {
+                                        warn!("gst warning {:?}", warning.get_debug());
+                                        Ok(())
+                                    },
+                                    MessageView::Info(info) => {
+                                        info!("gst info {:?}", info.get_debug());
+                                        Ok(())
+                                    },
+                                    _ => Ok(()),
+                                }
+                            },
+                        };
+                    }
+
                 }
                 Ok(())
             });
@@ -154,7 +175,8 @@ impl PlayerBackend for GstBackend {
 
     fn queue_next(&self, track: &Track) {
         let mut queue = self.queue.read();
-        queue.insert(self.current_index + 1, track.clone());
+        let current_index = self.current_index.load(atomic::Ordering::Relaxed);
+        queue.insert(current_index + 1, track.clone());
         self.queue.set(queue);
     }
 
@@ -171,43 +193,49 @@ impl PlayerBackend for GstBackend {
     }
 
     fn prev(&self) -> Result<Option<()>, Error> {
-        unimplemented!();
-//        if self.current_index == 0 {
-//            self.set_state(PlayerState::Stop)?;
-//            return Ok(None);
-//        }
-//        self.current_index -= 1;
-//        self.current_track = self.queue.get(self.current_index).cloned();
-//        if let Some(track) = self.current_track.clone() {
-//            self.set_track(&track)?;
-//            Ok(Some(()))
-//        }else {
-//            Ok(None)
-//        }
+        let mut current_index = self.current_index.load(atomic::Ordering::Relaxed);
+        if current_index == 0 {
+            self.set_state(PlayerState::Stop)?;
+            return Ok(None);
+        }
+
+        let queue = self.queue.read();
+
+        current_index -= 1;
+        self.current_index.store(current_index, atomic::Ordering::Relaxed);
+        if let Some(track) = queue.get(current_index) {
+            self.set_track(&track)?;
+            Ok(Some(()))
+        }else {
+            Ok(None)
+        }
     }
 
     fn next(&self) -> Result<Option<()>, Error> {
-        unimplemented!();
-//        if self.current_index >= self.queue.len() {
-//            self.set_state(PlayerState::Stop)?;
-//            return Ok(None);
-//        }
-//        self.current_index += 1;
-//        self.current_track = self.queue.get(self.current_index).cloned();
-//        if let Some(track) = self.current_track.clone() {
-//            self.set_track(&track)?;
-//            Ok(Some(()))
-//        }else {
-//            Ok(None)
-//        }
+        let mut current_index = self.current_index.load(atomic::Ordering::Relaxed);
+        let queue = self.queue.read();
+
+        if current_index >= queue.len() {
+            self.set_state(PlayerState::Stop)?;
+            return Ok(None);
+        }
+        current_index += 1;
+        self.current_index.store(current_index, atomic::Ordering::Relaxed);
+        if let Some(track) = queue.get(current_index) {
+            self.set_track(&track)?;
+            Ok(Some(()))
+        }else {
+            Ok(None)
+        }
     }
 
     fn set_state(&self, new_state: PlayerState) -> Result<(), Error> {
         debug!("set_state, {:?}", &new_state);
+        let current_index = self.current_index.load(atomic::Ordering::Relaxed);
         match new_state {
             PlayerState::Play => {
                 let queue = self.queue.read();
-                let track = &queue[self.current_index];
+                let track = &queue[current_index];
                 self.write_state(new_state);
                 self.set_track(track)
             },
