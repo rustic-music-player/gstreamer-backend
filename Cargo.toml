@@ -17,4 +17,3 @@ pinboard = "2.0.0"
 
 [dependencies.rustic-core]
 git = "https://github.com/rustic-music-player/core"
-branch = "feature/player-trait"
