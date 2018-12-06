@@ -1,5 +1,5 @@
-extern crate rustic_core as core;
 extern crate gstreamer as gst;
+extern crate rustic_core as core;
 #[macro_use]
 extern crate failure;
 #[macro_use]
@@ -7,15 +7,15 @@ extern crate log;
 extern crate crossbeam_channel as channel;
 extern crate pinboard;
 
-use core::{PlayerBackend, PlayerState, PlayerEvent, Track};
-use failure::{Error, err_msg};
-use std::time::Duration;
-use channel::{Sender, Receiver};
+use channel::{Receiver, Sender};
+use core::{PlayerBackend, PlayerEvent, PlayerState, Track};
+use failure::{err_msg, Error};
 use gst::{prelude::*, MessageView, StateChangeReturn};
-use std::sync::{Arc, atomic};
-use std::thread;
+use pinboard::NonEmptyPinboard;
 use std::any::Any;
-use pinboard::{NonEmptyPinboard};
+use std::sync::{atomic, Arc};
+use std::thread;
+use std::time::Duration;
 
 #[derive(Debug)]
 pub struct GstBackend {
@@ -30,7 +30,7 @@ pub struct GstBackend {
     volume: gst::Element,
     sink: gst::Element,
     tx: Sender<PlayerEvent>,
-    rx: Receiver<PlayerEvent>
+    rx: Receiver<PlayerEvent>,
 }
 
 impl GstBackend {
@@ -56,7 +56,7 @@ impl GstBackend {
             volume,
             sink,
             tx,
-            rx
+            rx,
         };
 
         backend.pipeline.add(&backend.decoder)?;
@@ -65,64 +65,67 @@ impl GstBackend {
 
         backend.volume.link(&backend.sink)?;
 
-        let sink_pad = backend.volume.get_static_pad("sink").ok_or_else(|| err_msg("missing sink pad on volume element"))?;
-        backend.decoder.connect_pad_added(move |_el: &gst::Element, pad: &gst::Pad| {
-            pad.link(&sink_pad);
-        });
+        let sink_pad = backend
+            .volume
+            .get_static_pad("sink")
+            .ok_or_else(|| err_msg("missing sink pad on volume element"))?;
+        backend
+            .decoder
+            .connect_pad_added(move |_el: &gst::Element, pad: &gst::Pad| {
+                pad.link(&sink_pad);
+            });
 
         let backend: Arc<Box<PlayerBackend>> = Arc::new(Box::new(backend));
 
         {
             let gst_backend = Arc::clone(&backend);
             let mut backend = Arc::clone(&backend);
-            thread::spawn(move|| {
-                let gst_backend: &GstBackend = match gst_backend.as_any().downcast_ref::<GstBackend>() {
-                    Some(b) => b,
-                    None => panic!("Not a GstBackend")
-                };
+            thread::spawn(move || {
+                let gst_backend: &GstBackend =
+                    match gst_backend.as_any().downcast_ref::<GstBackend>() {
+                        Some(b) => b,
+                        None => panic!("Not a GstBackend"),
+                    };
                 if let Some(bus) = gst_backend.pipeline.get_bus() {
                     loop {
                         let res: Result<(), Error> = match bus.pop() {
                             None => Ok(()),
-                            Some(msg) => {
-                                match msg.view() {
-                                    MessageView::Eos(..) => {
-                                        println!("eos");
-                                        backend.next()?;
-                                        Ok(())
-                                    },
-                                    MessageView::Error(err) => {
-                                        error!(
-                                            "Error from {}: {} ({:?})",
-                                            msg.get_src().unwrap().get_path_string(),
-                                            err.get_error(),
-                                            err.get_debug()
-                                        );
-                                        bail!(
-                                            "Error from {}: {} ({:?})",
-                                            msg.get_src().unwrap().get_path_string(),
-                                            err.get_error(),
-                                            err.get_debug()
-                                        );
-                                    },
-                                    MessageView::Buffering(buffering) => {
-                                        debug!("buffering {}", buffering.get_percent());
-                                        Ok(())
-                                    },
-                                    MessageView::Warning(warning) => {
-                                        warn!("gst warning {:?}", warning.get_debug());
-                                        Ok(())
-                                    },
-                                    MessageView::Info(info) => {
-                                        info!("gst info {:?}", info.get_debug());
-                                        Ok(())
-                                    },
-                                    _ => Ok(()),
+                            Some(msg) => match msg.view() {
+                                MessageView::Eos(..) => {
+                                    println!("eos");
+                                    backend.next()?;
+                                    Ok(())
                                 }
+                                MessageView::Error(err) => {
+                                    error!(
+                                        "Error from {}: {} ({:?})",
+                                        msg.get_src().unwrap().get_path_string(),
+                                        err.get_error(),
+                                        err.get_debug()
+                                    );
+                                    bail!(
+                                        "Error from {}: {} ({:?})",
+                                        msg.get_src().unwrap().get_path_string(),
+                                        err.get_error(),
+                                        err.get_debug()
+                                    );
+                                }
+                                MessageView::Buffering(buffering) => {
+                                    debug!("buffering {}", buffering.get_percent());
+                                    Ok(())
+                                }
+                                MessageView::Warning(warning) => {
+                                    warn!("gst warning {:?}", warning.get_debug());
+                                    Ok(())
+                                }
+                                MessageView::Info(info) => {
+                                    info!("gst info {:?}", info.get_debug());
+                                    Ok(())
+                                }
+                                _ => Ok(()),
                             },
                         };
                     }
-
                 }
                 Ok(())
             });
@@ -136,12 +139,13 @@ impl GstBackend {
         if let StateChangeReturn::Failure = self.pipeline.set_state(gst::State::Null) {
             bail!("can't stop pipeline")
         }
-        self.decoder.set_property_from_str("uri", track.stream_url.as_str());
+        self.decoder
+            .set_property_from_str("uri", track.stream_url.as_str());
 
         let state = match self.state.read() {
             PlayerState::Play => gst::State::Playing,
             PlayerState::Pause => gst::State::Paused,
-            PlayerState::Stop => gst::State::Null
+            PlayerState::Stop => gst::State::Null,
         };
 
         if let StateChangeReturn::Failure = self.pipeline.set_state(state) {
@@ -202,11 +206,12 @@ impl PlayerBackend for GstBackend {
         let queue = self.queue.read();
 
         current_index -= 1;
-        self.current_index.store(current_index, atomic::Ordering::Relaxed);
+        self.current_index
+            .store(current_index, atomic::Ordering::Relaxed);
         if let Some(track) = queue.get(current_index) {
             self.set_track(&track)?;
             Ok(Some(()))
-        }else {
+        } else {
             Ok(None)
         }
     }
@@ -220,11 +225,12 @@ impl PlayerBackend for GstBackend {
             return Ok(None);
         }
         current_index += 1;
-        self.current_index.store(current_index, atomic::Ordering::Relaxed);
+        self.current_index
+            .store(current_index, atomic::Ordering::Relaxed);
         if let Some(track) = queue.get(current_index) {
             self.set_track(&track)?;
             Ok(Some(()))
-        }else {
+        } else {
             Ok(None)
         }
     }
@@ -238,7 +244,7 @@ impl PlayerBackend for GstBackend {
                 let track = &queue[current_index];
                 self.write_state(new_state);
                 self.set_track(track)
-            },
+            }
             PlayerState::Pause => {
                 if let StateChangeReturn::Failure = self.pipeline.set_state(gst::State::Paused) {
                     error!("can't play pipeline");
@@ -246,7 +252,7 @@ impl PlayerBackend for GstBackend {
                 }
                 self.write_state(new_state);
                 Ok(())
-            },
+            }
             PlayerState::Stop => {
                 if let StateChangeReturn::Failure = self.pipeline.set_state(gst::State::Null) {
                     error!("can't play pipeline");
