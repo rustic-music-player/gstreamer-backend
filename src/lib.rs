@@ -79,7 +79,7 @@ impl GstBackend {
 
         {
             let gst_backend = Arc::clone(&backend);
-            let mut backend = Arc::clone(&backend);
+            let backend = Arc::clone(&backend);
             thread::spawn(move || {
                 let gst_backend: &GstBackend =
                     match gst_backend.as_any().downcast_ref::<GstBackend>() {
@@ -88,7 +88,7 @@ impl GstBackend {
                     };
                 if let Some(bus) = gst_backend.pipeline.get_bus() {
                     loop {
-                        let res: Result<(), Error> = match bus.pop() {
+                        let _res: Result<(), Error> = match bus.pop() {
                             None => Ok(()),
                             Some(msg) => match msg.view() {
                                 MessageView::Eos(..) => {
