@@ -1,24 +1,27 @@
-extern crate gstreamer as gst;
-extern crate rustic_core as core;
+extern crate crossbeam_channel as channel;
 #[macro_use]
 extern crate failure;
+extern crate gstreamer as gst;
 #[macro_use]
 extern crate log;
-extern crate crossbeam_channel as channel;
 extern crate pinboard;
+extern crate rustic_core as core;
 
-use channel::{Receiver, Sender};
-use core::{PlayerBackend, PlayerEvent, PlayerState, Track};
-use failure::{err_msg, Error};
-use gst::{prelude::*, MessageView, StateChangeReturn};
-use pinboard::NonEmptyPinboard;
 use std::any::Any;
-use std::sync::{atomic, Arc};
+use std::sync::{Arc, atomic, Mutex};
 use std::thread;
 use std::time::Duration;
 
-#[derive(Debug)]
+use channel::{Receiver, Sender};
+use failure::{err_msg, Error};
+use gst::{MessageView, prelude::*, StateChangeReturn};
+use pinboard::NonEmptyPinboard;
+
+use core::{PlayerBackend, PlayerEvent, PlayerState, Track};
+
 pub struct GstBackend {
+    // HACK: to get stream url build access
+    core: Arc<Mutex<Option<Arc<core::Rustic>>>>,
     queue: NonEmptyPinboard<Vec<Track>>,
     current_index: atomic::AtomicUsize,
     current_track: NonEmptyPinboard<Option<Track>>,
@@ -33,6 +36,18 @@ pub struct GstBackend {
     rx: Receiver<PlayerEvent>,
 }
 
+impl std::fmt::Debug for GstBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
+        write!(f, "GstBackend {{ queue: {:?}, current_index: {:?}, volume: {}, state: {:?}, blend_time: {:?} }}",
+               self.queue,
+               self.current_index,
+               self.current_volume,
+               self.state,
+               self.blend_time
+        )
+    }
+}
+
 impl GstBackend {
     pub fn new() -> Result<Arc<Box<PlayerBackend>>, Error> {
         gst::init()?;
@@ -45,6 +60,7 @@ impl GstBackend {
             .ok_or_else(|| err_msg("can't build autoaudiosink"))?;
         let (tx, rx) = channel::unbounded();
         let backend = GstBackend {
+            core: Arc::new(Mutex::new(None)),
             queue: NonEmptyPinboard::new(vec![]),
             current_index: atomic::AtomicUsize::new(0),
             current_track: NonEmptyPinboard::new(None),
@@ -134,13 +150,22 @@ impl GstBackend {
         Ok(backend)
     }
 
+    pub fn set_core(&self, core: Arc<core::Rustic>) {
+        let mut mut_ref = self.core.lock().unwrap();
+        *mut_ref = Some(core);
+    }
+
     fn set_track(&self, track: &Track) -> Result<(), Error> {
         debug!("Selecting {:?}", track);
         if let StateChangeReturn::Failure = self.pipeline.set_state(gst::State::Null) {
             bail!("can't stop pipeline")
         }
+
+        let core = self.core.lock().unwrap().clone().expect("setup not completed, core ref missing");
+        let stream_url = core.stream_url(track)?;
+
         self.decoder
-            .set_property_from_str("uri", track.stream_url.as_str());
+            .set_property_from_str("uri", stream_url.as_str());
 
         let state = match self.state.read() {
             PlayerState::Play => gst::State::Playing,
