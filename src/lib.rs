@@ -20,8 +20,7 @@ use pinboard::NonEmptyPinboard;
 use core::{PlayerBackend, PlayerEvent, PlayerState, Track};
 
 pub struct GstBackend {
-    // HACK: to get stream url build access
-    core: Arc<Mutex<Option<Arc<core::Rustic>>>>,
+    core: Arc<core::Rustic>,
     queue: NonEmptyPinboard<Vec<Track>>,
     current_index: atomic::AtomicUsize,
     current_track: NonEmptyPinboard<Option<Track>>,
@@ -49,7 +48,7 @@ impl std::fmt::Debug for GstBackend {
 }
 
 impl GstBackend {
-    pub fn new() -> Result<Arc<Box<PlayerBackend>>, Error> {
+    pub fn new(core: Arc<core::Rustic>) -> Result<Arc<Box<PlayerBackend>>, Error> {
         gst::init()?;
         let pipeline = gst::Pipeline::new(None);
         let decoder = gst::ElementFactory::make("uridecodebin", None)
@@ -60,7 +59,7 @@ impl GstBackend {
             .ok_or_else(|| err_msg("can't build autoaudiosink"))?;
         let (tx, rx) = channel::unbounded();
         let backend = GstBackend {
-            core: Arc::new(Mutex::new(None)),
+            core,
             queue: NonEmptyPinboard::new(vec![]),
             current_index: atomic::AtomicUsize::new(0),
             current_track: NonEmptyPinboard::new(None),
@@ -150,19 +149,13 @@ impl GstBackend {
         Ok(backend)
     }
 
-    pub fn set_core(&self, core: Arc<core::Rustic>) {
-        let mut mut_ref = self.core.lock().unwrap();
-        *mut_ref = Some(core);
-    }
-
     fn set_track(&self, track: &Track) -> Result<(), Error> {
         debug!("Selecting {:?}", track);
         if let StateChangeReturn::Failure = self.pipeline.set_state(gst::State::Null) {
             bail!("can't stop pipeline")
         }
 
-        let core = self.core.lock().unwrap().clone().expect("setup not completed, core ref missing");
-        let stream_url = core.stream_url(track)?;
+        let stream_url = self.core.stream_url(track)?;
 
         self.decoder
             .set_property_from_str("uri", stream_url.as_str());
